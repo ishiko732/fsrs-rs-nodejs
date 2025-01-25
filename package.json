@@ -3,7 +3,6 @@
   "version": "0.8.0",
   "description": "nodejs binding for fsrs-rs",
   "main": "index.js",
-  "type": "module",
   "repository": {
     "type": "git",
     "url": "https://github.com/open-spaced-repetition/rs-fsrs-nodejs"
