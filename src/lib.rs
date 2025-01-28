@@ -144,11 +144,15 @@ impl FSRS {
     )))
   }
 
-  #[napi]
+  #[napi(ts_return_type = "Promise<number[]>")]
   pub fn compute_parameters(
     &self,
     train_set: Vec<&FSRSItem>,
+    #[napi(
+      ts_arg_type = "(err: null | Error, value: { current: number, total: number, percent: number }) => void"
+    )]
     progress_js_fn: JsFunction,
+    signal: Option<AbortSignal>,
   ) -> Result<AsyncTask<ComputeParametersTask>> {
     // Convert your `JS` training items to owned `fsrs::FSRSItem`
     let train_data = train_set
@@ -179,7 +183,11 @@ impl FSRS {
       progress_callback: tsfn,
     };
 
-    Ok(AsyncTask::new(task))
+    let result = match signal {
+      Some(signal) => AsyncTask::with_signal(task, signal),
+      None => AsyncTask::new(task),
+    };
+    Ok(result)
   }
 
   #[napi]
