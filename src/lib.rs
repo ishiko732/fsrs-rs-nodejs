@@ -1,8 +1,10 @@
 #![deny(clippy::all)]
 use napi::bindgen_prelude::*;
-use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi::JsNumber;
 use std::sync::{Arc, Mutex};
+
+mod train_task;
+use train_task::{ComputeParametersTask, ProgressData};
 
 // https://github.com/rust-lang/rust-analyzer/issues/17429
 use napi_derive::napi;
@@ -24,104 +26,6 @@ pub const DEFAULT_PARAMETERS: [f32; 19] = [
 impl Default for FSRS {
   fn default() -> Self {
     Self::new(None)
-  }
-}
-
-#[derive(Debug)]
-pub struct ProgressData {
-  pub current: usize,
-  pub total: usize,
-  pub percent: f64,
-}
-
-/// A background task that runs `compute_parameters`, sending progress updates via TSFN.
-pub struct ComputeParametersTask {
-  // Thread-safe reference to your FSRS model
-  model: Arc<Mutex<fsrs::FSRS>>,
-  // Training data, made owned so it doesn't reference `&self`
-  train_data: Vec<fsrs::FSRSItem>,
-  // The threadsafe JS callback for partial updates
-  progress_callback: ThreadsafeFunction<ProgressData, ErrorStrategy::CalleeHandled>,
-}
-
-impl Task for ComputeParametersTask {
-  type Output = Vec<f32>;
-  type JsValue = Vec<f64>;
-
-  fn compute(&mut self) -> Result<Self::Output> {
-    // 1) Create a shared progress object
-    let progress_state = fsrs::CombinedProgressState::new_shared();
-    let progress_state_for_thread = Arc::clone(&progress_state);
-    // Clone what we need for the separate thread
-    let train_data = self.train_data.clone();
-    let model = Arc::clone(&self.model);
-
-    // 2) Spawn a new thread that does the heavy lifting
-    //    so we can poll progress *in parallel* on this thread.
-    let handle = std::thread::spawn(move || -> Result<Vec<f32>> {
-      let locked = model.lock().map_err(|_| {
-        Error::new(
-          Status::GenericFailure,
-          "Failed to lock FSRS model".to_string(),
-        )
-      })?;
-
-      // Now use `progress_state_for_thread` inside the closure
-      locked
-        .compute_parameters(train_data, Some(progress_state_for_thread), true)
-        .map_err(|e| Error::new(Status::GenericFailure, format!("{:?}", e)))
-    });
-
-    // 3) Meanwhile, on *this* thread, poll `progress_state` in a loop
-    //    and call `progress_callback` with updated progress.
-    loop {
-      let (current, total, finished) = {
-        let p = progress_state.lock().unwrap();
-        (p.current(), p.total(), p.finished())
-      };
-
-      let percent = if total == 0 {
-        0.0
-      } else {
-        (current as f64 / total as f64) as f64
-      };
-
-      // Call JS callback if you want once per second or whenever progress changes
-      let status = self.progress_callback.call(
-        Ok(ProgressData {
-          current,
-          total,
-          percent,
-        }),
-        ThreadsafeFunctionCallMode::NonBlocking,
-      );
-
-      if status != napi::Status::Ok {
-        eprintln!("Failed to call JS callback, status = {:?}", status);
-      }
-
-      if finished || percent >= 100.0 {
-        break;
-      }
-
-      // Sleep briefly before polling again
-      std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-
-    // 4) Join the compute thread to get the final result
-    let final_result = handle.join().map_err(|_| {
-      Error::new(
-        Status::GenericFailure,
-        "Panic occurred in compute thread".to_string(),
-      )
-    })??; // `??` to unwrap the `Result` from inside the thread
-
-    // 5) Return the final result
-    Ok(final_result)
-  }
-
-  fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
-    Ok(output.iter().map(|&x| x as f64).collect())
   }
 }
 
@@ -148,11 +52,11 @@ impl FSRS {
   pub fn compute_parameters(
     &self,
     train_set: Vec<&FSRSItem>,
+    enable_short_term: bool,
     #[napi(
       ts_arg_type = "(err: null | Error, value: { current: number, total: number, percent: number }) => void"
     )]
-    progress_js_fn: JsFunction,
-    signal: Option<AbortSignal>,
+    progress_js_fn: Option<JsFunction>,
   ) -> Result<AsyncTask<ComputeParametersTask>> {
     // Convert your `JS` training items to owned `fsrs::FSRSItem`
     let train_data = train_set
@@ -161,33 +65,32 @@ impl FSRS {
       .collect::<Vec<_>>();
 
     // Turn `JsFunction` into a `ThreadsafeFunction`
-    let tsfn: ThreadsafeFunction<ProgressData, ErrorStrategy::CalleeHandled> = progress_js_fn
-      .create_threadsafe_function(0, |ctx| {
+    let fn_form_js = if let Some(callback) = progress_js_fn {
+      Some(callback.create_threadsafe_function(0, |ctx| {
         let progress_data: ProgressData = ctx.value;
         let env = ctx.env;
+        let current = env.create_uint32(progress_data.current as u32)?;
+        let total = env.create_uint32(progress_data.total as u32)?;
+        let percent = env.create_double(progress_data.percent)?;
         let mut progress_obj = env.create_object()?;
-
-        progress_obj.set("current", env.create_uint32(progress_data.current as u32)?)?;
-        progress_obj.set("total", env.create_uint32(progress_data.total as u32)?)?;
-        progress_obj.set("percent", progress_data.percent as f32)?;
-
-        // Return it as the single argument to JS
+        progress_obj.set_named_property("current", current)?;
+        progress_obj.set_named_property("total", total)?;
+        progress_obj.set_named_property("percent", percent)?;
         Ok(vec![progress_obj])
-      })?;
+      })?)
+    } else {
+      None
+    };
 
-    // We assume `FSRS` internally stores `Arc<Mutex<fsrs::FSRS>>` or something similar
-    // so it's already thread-safe. If not, you must fix that part first.
     let task = ComputeParametersTask {
-      model: Arc::clone(&self.0), // e.g., if `this.0` is `Arc<Mutex<fsrs::FSRS>>`
+      model: Arc::clone(&self.0),
       train_data,
-      progress_callback: tsfn,
+      enable_short_term,
+      progress_callback: fn_form_js,
+      milliseconds: 100, //100ms
     };
 
-    let result = match signal {
-      Some(signal) => AsyncTask::with_signal(task, signal),
-      None => AsyncTask::new(task),
-    };
-    Ok(result)
+    Ok(AsyncTask::new(task))
   }
 
   #[napi]
